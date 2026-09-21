@@ -40,7 +40,12 @@ jobs:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-${{ runner.os }}-v2-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-${{ runner.os }}-v3-${{ hashFiles('buildozer.spec') }}
+
+      - name: Constrain pip everywhere in this job
+        run: |
+          echo "pip<25" > "$GITHUB_WORKSPACE/pip-constraints.txt"
+          echo "PIP_CONSTRAINT=$GITHUB_WORKSPACE/pip-constraints.txt" >> "$GITHUB_ENV"
 
       - name: Build debug APK
         run: buildozer -v android debug
