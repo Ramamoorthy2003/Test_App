@@ -5,24 +5,30 @@ Kivy single-file app. No database, no external assets.
 
 Controls
 --------
-  Tap inside a player card ......... +1 touch for that player (only while timer runs)
+  Tap inside a player card ......... +1 touch for that player (only while timer runs,
+                                       disabled during the Sudden Death round - sensor only)
   Tap anywhere else ................ pause / resume
-  START ............................ start the round (must be pressed for every round)
-  End Round ........................ force the current round to end (disabled in decider)
-  NEW MATCH ........................ reset everything (disabled in decider)
-  SETTINGS .......................... change round duration (disabled in decider)
+  START ............................ start the round (must be pressed for every round;
+                                       shows a one-time confirmation popup for Round 1 only)
+  End Round ........................ force the current round to end (never locked)
+  NEW MATCH ......................... reset everything (never locked)
+  SETTINGS .......................... change round duration (never locked)
 
 Match rules
 -----------
-  * Each round keeps its OWN score (score resets to 0-0 at the start of every round).
+  * Rounds 1 & 2 each keep their OWN score (score resets to 0-0 at the start of
+    every round) and use the configurable round duration (Settings).
   * Best of 2 rounds. If a player wins both, the match ends immediately after round 2.
-  * If the rounds are tied 1-1 after round 2, a ROUND 3 "sudden death" decider starts.
-  * In the decider: the first point scored by either player wins the match instantly.
-    Only START/PAUSE/RESUME work in the decider - End Round / New Match / Settings are
-    locked so the round cannot be interrupted.
-  * If the decider clock runs out with the scores still level (no point scored by
-    either side), a coin-toss popup appears - tap PLAYER A or PLAYER B to declare
-    the winner.
+  * If rounds 1-2 are tied 1-1, ROUND 3 "EXTRA ROUND" starts - a normal, fully
+    scorable round, fixed at 30 seconds. Whoever scores more in it wins the match.
+  * If Round 3 also ends tied, ROUND 4 "SUDDEN DEATH" starts - fixed at 30 seconds.
+    In Sudden Death the first point scored wins the match instantly, and only
+    sensor (ESP32) hits can score - manual taps/buttons are shown but do nothing.
+    Nothing is locked in Sudden Death: End Round / New Match / Settings all work.
+  * If the Sudden Death clock runs out with no point scored, a coin-toss popup
+    appears - tap PLAYER A or PLAYER B to declare the winner.
+  * Every round-over / match-over popup shows the score as RED / BLUE (not A / B),
+    plus a running history of every round played and the running point total.
 
 ESP32 protocol (TCP, port 5005), one command per line:
   A:HIT   B:HIT   A:PENALTY   B:PENALTY
@@ -65,7 +71,10 @@ from kivy.utils import platform
 # --------------------------------------------------------------------------- #
 
 DEFAULT_ROUND_SECONDS = 60
-ROUNDS_PER_MATCH = 2          # round 3 (sudden-death decider) is added only on a 1-1 tie
+ROUNDS_PER_MATCH = 2          # rounds 1-2 are the normal best-of
+EXTRA_ROUND_NO = ROUNDS_PER_MATCH + 1     # round 3 - normal scoring, fixed 30s
+SUDDEN_DEATH_ROUND_NO = ROUNDS_PER_MATCH + 2  # round 4 - first point wins, fixed 30s
+TIEBREAK_SECONDS = 30          # fixed duration for round 3 and round 4
 PENALTY_FLOOR_ZERO = True     # score never goes below 0
 TCP_PORT = 5005
 DEBOUNCE_SECONDS = 0.25       # ignore a repeat score for the same player inside this window
@@ -83,6 +92,8 @@ GREEN     = (0.133, 0.694, 0.427, 1)
 GREY      = (0.322, 0.365, 0.443, 1)
 WHITE     = (0.937, 0.953, 0.973, 1)
 DIM       = (0.569, 0.611, 0.678, 1)
+
+COLOR_NAME = {'A': 'RED', 'B': 'BLUE'}
 
 # match states
 IDLE, RUNNING, PAUSED, BREAK, FINISHED = 'idle', 'running', 'paused', 'break', 'finished'
@@ -322,13 +333,14 @@ def make_label(text, size, color=WHITE, bold=False, halign='center'):
 
 def popup(message, sub='', button_text=None, on_close=None,
           auto_seconds=None, accent=GOLD,
-          sub_size=17, sub_color=DIM, sub_bold=False):
+          sub_size=17, sub_color=DIM, sub_bold=False,
+          size_hint=(0.72, 0.64)):
     """Centered modal. Either a button, or an auto-dismiss timer, or both."""
-    view = ModalView(size_hint=(0.66, 0.58), auto_dismiss=False,
+    view = ModalView(size_hint=size_hint, auto_dismiss=False,
                      background_color=(0, 0, 0, 0.75))
     card = Card(bg=PANEL_BG, orientation='vertical',
                 padding=dp(18), spacing=dp(10))
-    card.add_widget(make_label(message, 30, accent, bold=True))
+    card.add_widget(make_label(message, 28, accent, bold=True))
     if sub:
         card.add_widget(make_label(sub, sub_size, sub_color, bold=sub_bold))
 
@@ -396,7 +408,8 @@ class PlayerPanel(Card):
         self.pen_lbl.text = 'PENALTY  %d' % penalties
 
     def set_locked(self, locked):
-        """Grey out and disable the score buttons when the timer isn't running."""
+        """Grey out the score buttons when they can't currently score
+        (timer not running, or Sudden Death sensor-only mode)."""
         for btn in (self.touch_btn, self.penalty_btn):
             btn.disabled = locked
             btn.opacity = 0.35 if locked else 1
@@ -443,12 +456,14 @@ class SilambamApp(App):
         self.round_seconds = DEFAULT_ROUND_SECONDS
         self.state = IDLE
         self.round_no = 1
-        self.remaining = float(self.round_seconds)
         self.score = {'A': 0, 'B': 0}
         self.penalties = {'A': 0, 'B': 0}
         self.round_wins = {'A': 0, 'B': 0}
+        self.round_history = []            # [{'round':1,'a':x,'b':y}, ...]
         self._last_score_time = {'A': 0.0, 'B': 0.0}
         self._pause_view = None
+        self._match_started_once = False   # first-start popup shows only once per match
+        self.remaining = float(self._round_duration())
 
         self.audio = Audio(self.user_data_dir)
 
@@ -476,34 +491,47 @@ class SilambamApp(App):
 
     def _build_center(self):
         col = Card(bg=PANEL_BG, orientation='vertical', padding=dp(10),
-                   spacing=dp(6), size_hint_x=0.32)
+                   spacing=dp(4), size_hint_x=0.32)
 
-        top = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(6))
-        self.round_lbl = make_label('ROUND 1', 18, GOLD, bold=True)
+        top = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
+        self.round_lbl = make_label('ROUND 1', 17, GOLD, bold=True)
         self.round_lbl.shorten = True
         top.add_widget(self.round_lbl)
         gear = make_button('SETTINGS', CARD_BG, self.open_settings, font_size=12)
         gear.size_hint_x = None
-        gear.width = dp(88)
+        gear.width = dp(84)
         top.add_widget(gear)
         self.settings_btn = gear
         col.add_widget(top)
 
-        self.time_lbl = make_label('01:00', 84, WHITE, bold=True)
-        col.add_widget(self.time_lbl)
+        # fixed-height box for the clock so big digits never bleed into the
+        # round/settings row above or the status label below
+        time_box = BoxLayout(size_hint_y=None, height=dp(112))
+        self.time_lbl = make_label('01:00', 58, WHITE, bold=True)
+        time_box.add_widget(self.time_lbl)
+        col.add_widget(time_box)
 
-        self.state_lbl = make_label('PRESS START', 15, DIM)
+        self.state_lbl = make_label('PRESS START', 14, DIM)
         self.state_lbl.shorten = True
         self.state_lbl.size_hint_y = None
-        self.state_lbl.height = dp(24)
+        self.state_lbl.height = dp(22)
         col.add_widget(self.state_lbl)
+
+        # small persistent round-history strip
+        self.history_lbl = make_label('', 12, DIM)
+        self.history_lbl.size_hint_y = None
+        self.history_lbl.height = dp(18)
+        col.add_widget(self.history_lbl)
+
+        # flexible spacer absorbs any leftover vertical space
+        col.add_widget(Widget(size_hint_y=1))
 
         self.start_btn = make_button('START', GREEN, self.on_start_button, font_size=22)
         self.start_btn.size_hint_y = None
-        self.start_btn.height = dp(56)
+        self.start_btn.height = dp(54)
         col.add_widget(self.start_btn)
 
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
         self.end_round_btn = make_button('End Round', GREY, self.end_round_manual, font_size=15)
         self.new_match_btn = make_button('NEW MATCH', CARD_BG, self.confirm_new_match, font_size=15)
         row.add_widget(self.end_round_btn)
@@ -512,32 +540,66 @@ class SilambamApp(App):
 
         self.net_lbl = make_label('ESP32 server starting...', 12, DIM)
         self.net_lbl.size_hint_y = None
-        self.net_lbl.height = dp(22)
+        self.net_lbl.height = dp(20)
         col.add_widget(self.net_lbl)
         return col
 
-    # ---------------- decider (round 3 sudden death) ----------------
+    # ---------------- round type helpers ----------------
 
     @property
-    def is_decider(self):
-        return self.round_no > ROUNDS_PER_MATCH
+    def is_extra_round(self):
+        """Round 3: normal scoring, fixed 30s, decides the match outright."""
+        return self.round_no == EXTRA_ROUND_NO
 
-    def _check_decider_result(self):
-        if self.is_decider and self.state == RUNNING and self.score['A'] != self.score['B']:
+    @property
+    def is_sudden_death(self):
+        """Round 4: fixed 30s, first point wins instantly, sensor-only scoring."""
+        return self.round_no == SUDDEN_DEATH_ROUND_NO
+
+    def _round_duration(self):
+        if self.round_no in (EXTRA_ROUND_NO, SUDDEN_DEATH_ROUND_NO):
+            return float(TIEBREAK_SECONDS)
+        return float(self.round_seconds)
+
+    def _history_text(self):
+        lines = []
+        total_a = total_b = 0
+        for h in self.round_history:
+            label = 'EXTRA ROUND' if h['round'] == EXTRA_ROUND_NO else 'ROUND %d' % h['round']
+            lines.append('%s   RED %d - %d BLUE' % (label, h['a'], h['b']))
+            total_a += h['a']
+            total_b += h['b']
+        if len(self.round_history) > 1:
+            lines.append('')
+            lines.append('TOTAL POINTS   RED %d - %d BLUE' % (total_a, total_b))
+        return '\n'.join(lines)
+
+    def _refresh_history_strip(self):
+        bits = []
+        for h in self.round_history:
+            tag = 'E' if h['round'] == EXTRA_ROUND_NO else ('R%d' % h['round'])
+            bits.append('%s: %d-%d' % (tag, h['a'], h['b']))
+        self.history_lbl.text = '   '.join(bits)
+
+    # ---------------- sudden death (round 4) ----------------
+
+    def _check_sudden_death_result(self):
+        if self.is_sudden_death and self.state == RUNNING and self.score['A'] != self.score['B']:
             winner = 'A' if self.score['A'] > self.score['B'] else 'B'
-            self._decider_win(winner)
+            self._sudden_death_win(winner)
 
-    def _decider_win(self, key):
+    def _sudden_death_win(self, key, reason='SUDDEN DEATH - first point wins!'):
         self.round_wins[key] += 1
         self.state = FINISHED
         self._refresh()
-        label = 'PLAYER A WINS' if key == 'A' else 'PLAYER B WINS'
+        label = '%s WINS THE MATCH' % COLOR_NAME[key]
         accent = RED if key == 'A' else BLUE
-        popup(label, 'Sudden death - first point wins!',
-              button_text='CLOSE', accent=accent,
-              sub_size=22, sub_color=WHITE, sub_bold=True)
+        body = self._history_text()
+        body = (body + '\n\n' + reason) if body else reason
+        popup(label, body, button_text='CLOSE', accent=accent,
+              sub_size=17, sub_color=WHITE, sub_bold=True)
 
-    def _decider_timeout(self):
+    def _sudden_death_timeout(self):
         self.state = BREAK
         self.audio.play('timeup')
         self._refresh()
@@ -554,7 +616,7 @@ class SilambamApp(App):
 
         def choose(key):
             view.dismiss()
-            self._decider_win(key)
+            self._sudden_death_win(key, reason='Decided by coin toss')
 
         row.add_widget(make_button('PLAYER A', RED, lambda: choose('A'), font_size=20))
         row.add_widget(make_button('PLAYER B', BLUE, lambda: choose('B'), font_size=20))
@@ -568,6 +630,9 @@ class SilambamApp(App):
         if self.state != RUNNING:
             self._blip('Timer is not running')
             return
+        if manual and self.is_sudden_death:
+            self._blip('SUDDEN DEATH - sensor scoring only')
+            return
         now = time.time()
         if now - self._last_score_time.get(key, 0.0) < DEBOUNCE_SECONDS:
             return                                  # one tap = one point, ignore the bounce
@@ -576,11 +641,14 @@ class SilambamApp(App):
         self.audio.play('touch')
         self._flash(key)
         self._refresh()
-        self._check_decider_result()
+        self._check_sudden_death_result()
 
     def add_penalty(self, key, manual=False):
         if self.state != RUNNING:
             self._blip('Timer is not running')
+            return
+        if manual and self.is_sudden_death:
+            self._blip('SUDDEN DEATH - sensor scoring only')
             return
         now = time.time()
         if now - self._last_score_time.get(key, 0.0) < DEBOUNCE_SECONDS:
@@ -593,7 +661,7 @@ class SilambamApp(App):
         self.audio.play('penalty')
         self._flash(key, penalty=True)
         self._refresh()
-        self._check_decider_result()
+        self._check_sudden_death_result()
 
     def _flash(self, key, penalty=False):
         panel = self.panel_a if key == 'A' else self.panel_b
@@ -611,7 +679,7 @@ class SilambamApp(App):
 
     def on_panel_tap(self, key):
         if self.state == RUNNING:
-            self.add_hit(key)
+            self.add_hit(key, manual=True)
         # while paused/idle a panel tap is deliberately ignored
 
     def on_background_tap(self):
@@ -624,7 +692,10 @@ class SilambamApp(App):
 
     def on_start_button(self):
         if self.state == IDLE:
-            self.start_round()
+            if self.round_no == 1 and not self._match_started_once:
+                self._show_first_start_popup()
+            else:
+                self.start_round()
         elif self.state == RUNNING:
             self.pause()
         elif self.state == PAUSED:
@@ -632,8 +703,17 @@ class SilambamApp(App):
         elif self.state == FINISHED:
             self.confirm_new_match()
 
+    def _show_first_start_popup(self):
+        def begin():
+            self._match_started_once = True
+            self.start_round()
+
+        popup('SILAMBAM MATCH', 'Round 1 of %d  -  tap START to begin' % ROUNDS_PER_MATCH,
+              button_text='START', on_close=begin, accent=GREEN,
+              sub_size=16, sub_color=DIM, size_hint=(0.66, 0.5))
+
     def start_round(self):
-        self.remaining = float(self.round_seconds)
+        self.remaining = self._round_duration()
         self.state = RUNNING
         self._refresh()
 
@@ -663,8 +743,7 @@ class SilambamApp(App):
         self._refresh()
 
     def end_round_manual(self):
-        if self.is_decider:
-            return                      # locked - decider ends by sudden death or coin toss
+        # never locked - works in every round, including Sudden Death
         if self.state in (RUNNING, PAUSED):
             if self._pause_view:
                 self._pause_view.dismiss()
@@ -672,8 +751,9 @@ class SilambamApp(App):
             self._end_round()
 
     def _end_round(self):
-        if self.is_decider:
-            self._decider_timeout()
+        if self.is_sudden_death:
+            # timer ran out (or End Round pressed) with no decisive point yet
+            self._sudden_death_timeout()
             return
 
         self.state = BREAK
@@ -682,24 +762,39 @@ class SilambamApp(App):
         self._refresh()
 
         a, b = self.score['A'], self.score['B']
-        round_winner = 'A' if a > b else ('B' if b > a else None)
-        if round_winner:
-            self.round_wins[round_winner] += 1
-        summary = 'A  %d   -   %d  B' % (a, b)
+        self.round_history.append({'round': self.round_no, 'a': a, 'b': b})
+        self._refresh_history_strip()
 
-        if self.round_no < ROUNDS_PER_MATCH:
-            popup('ROUND %d OVER' % self.round_no, summary,
-                  button_text='NEXT ROUND', on_close=self._prepare_round,
-                  accent=GOLD, sub_size=36, sub_color=WHITE, sub_bold=True)
+        if self.round_no <= ROUNDS_PER_MATCH:
+            round_winner = 'A' if a > b else ('B' if b > a else None)
+            if round_winner:
+                self.round_wins[round_winner] += 1
+
+            if self.round_no < ROUNDS_PER_MATCH:
+                popup('ROUND %d OVER' % self.round_no, self._history_text(),
+                      button_text='NEXT ROUND', on_close=self._prepare_round,
+                      accent=GOLD, sub_size=17, sub_color=WHITE, sub_bold=True)
+                return
+
+            if self.round_wins['A'] == self.round_wins['B']:
+                popup('ROUND %d OVER' % self.round_no,
+                      self._history_text() + '\n\nROUNDS LEVEL - EXTRA ROUND NEXT',
+                      button_text='NEXT ROUND', on_close=self._prepare_round,
+                      accent=GOLD, sub_size=17, sub_color=WHITE, sub_bold=True)
+            else:
+                self._finish()
             return
 
-        if self.round_wins['A'] == self.round_wins['B']:
-            popup('ROUND %d OVER' % self.round_no,
-                  summary + '\nROUNDS LEVEL - DECIDER ROUND NEXT',
-                  button_text='NEXT ROUND', on_close=self._prepare_round,
-                  accent=GOLD, sub_size=30, sub_color=WHITE, sub_bold=True)
-        else:
+        # round_no == EXTRA_ROUND_NO (round 3)
+        if a != b:
+            winner = 'A' if a > b else 'B'
+            self.round_wins[winner] += 1
             self._finish()
+        else:
+            popup('EXTRA ROUND TIED',
+                  self._history_text() + '\n\nSUDDEN DEATH NEXT - first point wins',
+                  button_text='NEXT ROUND', on_close=self._prepare_round,
+                  accent=GOLD, sub_size=17, sub_color=WHITE, sub_bold=True)
 
     def _prepare_round(self):
         """Advance to the next round but wait for a manual START press."""
@@ -707,26 +802,29 @@ class SilambamApp(App):
         self.score = {'A': 0, 'B': 0}
         self.penalties = {'A': 0, 'B': 0}
         self.state = IDLE
+        self.remaining = self._round_duration()
         self._refresh()
 
     def _finish(self):
         self.state = FINISHED
         aw, bw = self.round_wins['A'], self.round_wins['B']
         if aw > bw:
-            winner, accent = 'PLAYER A WINS', RED
+            winner, accent = 'RED WINS THE MATCH', RED
         elif bw > aw:
-            winner, accent = 'PLAYER B WINS', BLUE
+            winner, accent = 'BLUE WINS THE MATCH', BLUE
         else:
             winner, accent = 'MATCH DRAWN', GOLD
         self._refresh()
-        popup(winner, 'Rounds won   A  %d   -   %d  B' % (aw, bw),
-              button_text='CLOSE', accent=accent,
-              sub_size=28, sub_color=WHITE, sub_bold=True)
+        body = self._history_text() + '\n\nROUNDS WON   RED %d - %d BLUE' % (aw, bw)
+        popup(winner, body, button_text='CLOSE', accent=accent,
+              sub_size=17, sub_color=WHITE, sub_bold=True)
 
     def confirm_new_match(self):
-        if self.is_decider and self.state in (RUNNING, PAUSED):
-            return                      # locked during the decider round
+        # never locked - works in every round, including Sudden Death
         if self.state in (RUNNING, PAUSED):
+            if self._pause_view:
+                self._pause_view.dismiss()
+                self._pause_view = None
             self.state = PAUSED
             self._refresh()
         popup('START A NEW MATCH?', 'Scores and rounds will be cleared',
@@ -738,10 +836,13 @@ class SilambamApp(App):
             self._pause_view = None
         self.state = IDLE
         self.round_no = 1
-        self.remaining = float(self.round_seconds)
         self.score = {'A': 0, 'B': 0}
         self.penalties = {'A': 0, 'B': 0}
         self.round_wins = {'A': 0, 'B': 0}
+        self.round_history = []
+        self._match_started_once = False
+        self.remaining = self._round_duration()
+        self._refresh_history_strip()
         self._refresh()
 
     # ---------------- clock ----------------
@@ -752,8 +853,8 @@ class SilambamApp(App):
         self.remaining -= dt
         if self.remaining <= 0:
             self.remaining = 0.0
-            if self.is_decider:
-                self._decider_timeout()
+            if self.is_sudden_death:
+                self._sudden_death_timeout()
             else:
                 self._end_round()
             return
@@ -775,7 +876,7 @@ class SilambamApp(App):
             handled += 1
             key, _, action = cmd.partition(':')
             if action in ('HIT', 'TOUCH'):
-                self.add_hit(key)
+                self.add_hit(key)              # manual=False -> always allowed, incl. Sudden Death
             elif action in ('PENALTY', 'FOUL'):
                 self.add_penalty(key)
 
@@ -791,19 +892,20 @@ class SilambamApp(App):
     # ---------------- settings ----------------
 
     def open_settings(self):
-        if self.is_decider and self.state in (RUNNING, PAUSED):
-            return                      # locked during the decider round
-
+        # never locked - works in every round, including Sudden Death
         was_running = self.state == RUNNING
         if was_running:
             self.state = PAUSED
             self._refresh()
 
-        view = ModalView(size_hint=(0.6, 0.6), auto_dismiss=False,
+        view = ModalView(size_hint=(0.6, 0.62), auto_dismiss=False,
                          background_color=(0, 0, 0, 0.75))
         card = Card(bg=PANEL_BG, orientation='vertical',
                     padding=dp(18), spacing=dp(10))
-        card.add_widget(make_label('ROUND DURATION (SECONDS)', 20, GOLD, bold=True))
+        card.add_widget(make_label('ROUND DURATION (SECONDS)', 19, GOLD, bold=True))
+        card.add_widget(make_label('Applies to Rounds 1 & 2 only  -  Extra Round and\n'
+                                    'Sudden Death are always fixed at %ds' % TIEBREAK_SECONDS,
+                                    12, DIM))
 
         ti = TextInput(text=str(self.round_seconds), multiline=False,
                        input_filter='int', halign='center',
@@ -833,8 +935,8 @@ class SilambamApp(App):
                 note.text = 'Enter a value between 5 and 3600'
                 return
             self.round_seconds = val
-            if self.state in (IDLE, FINISHED) or self.remaining > val:
-                self.remaining = float(val)
+            if self.state in (IDLE, FINISHED) or self.remaining > self._round_duration():
+                self.remaining = self._round_duration()
             view.dismiss()
             self._refresh()
             if was_running:
@@ -860,28 +962,38 @@ class SilambamApp(App):
     def _refresh(self, *_a):
         self.panel_a.update(self.score['A'], self.penalties['A'])
         self.panel_b.update(self.score['B'], self.penalties['B'])
-        score_locked = self.state != RUNNING
-        self.panel_a.set_locked(score_locked)
-        self.panel_b.set_locked(score_locked)
-        self.round_lbl.text = 'ROUND %d' % self.round_no
-        self.time_lbl.text = self._clock_text()
+        manual_locked = (self.state != RUNNING) or self.is_sudden_death
+        self.panel_a.set_locked(manual_locked)
+        self.panel_b.set_locked(manual_locked)
 
-        # decider round: only START / PAUSE / RESUME are allowed
-        lock_extra = self.is_decider and self.state in (RUNNING, PAUSED)
-        for btn in (self.end_round_btn, self.new_match_btn, self.settings_btn):
-            btn.disabled = lock_extra
-            btn.opacity = 0.35 if lock_extra else 1
+        if self.round_no <= ROUNDS_PER_MATCH:
+            self.round_lbl.text = 'ROUND %d' % self.round_no
+        elif self.is_extra_round:
+            self.round_lbl.text = 'EXTRA ROUND'
+        else:
+            self.round_lbl.text = 'SUDDEN DEATH'
+
+        self.time_lbl.text = self._clock_text()
 
         if self.state == IDLE:
             self.start_btn.text = 'START'
             self.start_btn.background_color = GREEN
-            self.state_lbl.text = 'SUDDEN DEATH - PRESS START' if self.is_decider else 'PRESS START'
+            if self.is_extra_round:
+                self.state_lbl.text = 'EXTRA ROUND (%ds) - PRESS START' % TIEBREAK_SECONDS
+            elif self.is_sudden_death:
+                self.state_lbl.text = 'SUDDEN DEATH (%ds) - SENSOR ONLY' % TIEBREAK_SECONDS
+            else:
+                self.state_lbl.text = 'PRESS START'
             self.time_lbl.color = WHITE
         elif self.state == RUNNING:
             self.start_btn.text = 'PAUSE'
             self.start_btn.background_color = GOLD
-            self.state_lbl.text = ('SUDDEN DEATH - FIRST POINT WINS' if self.is_decider
-                                    else 'LIVE  -  tap a player box to score')
+            if self.is_sudden_death:
+                self.state_lbl.text = 'SUDDEN DEATH - SENSOR SCORING ONLY'
+            elif self.is_extra_round:
+                self.state_lbl.text = 'EXTRA ROUND - LIVE'
+            else:
+                self.state_lbl.text = 'LIVE  -  tap a player box to score'
             self.time_lbl.color = GREEN if self.remaining > 10 else RED
         elif self.state == PAUSED:
             self.start_btn.text = 'RESUME'
