@@ -7,10 +7,22 @@ Controls
 --------
   Tap inside a player card ......... +1 touch for that player (only while timer runs)
   Tap anywhere else ................ pause / resume
-  START ............................ start the round
-  End Round ........................ force the current round to end
-  NEW MATCH ........................ reset everything
-  SETTINGS ......................... change round duration
+  START ............................ start the round (must be pressed for every round)
+  End Round ........................ force the current round to end (disabled in decider)
+  NEW MATCH ........................ reset everything (disabled in decider)
+  SETTINGS .......................... change round duration (disabled in decider)
+
+Match rules
+-----------
+  * Each round keeps its OWN score (score resets to 0-0 at the start of every round).
+  * Best of 2 rounds. If a player wins both, the match ends immediately after round 2.
+  * If the rounds are tied 1-1 after round 2, a ROUND 3 "sudden death" decider starts.
+  * In the decider: the first point scored by either player wins the match instantly.
+    Only START/PAUSE/RESUME work in the decider - End Round / New Match / Settings are
+    locked so the round cannot be interrupted.
+  * If the decider clock runs out with the scores still level (no point scored by
+    either side), a coin-toss popup appears - tap PLAYER A or PLAYER B to declare
+    the winner.
 
 ESP32 protocol (TCP, port 5005), one command per line:
   A:HIT   B:HIT   A:PENALTY   B:PENALTY
@@ -22,6 +34,7 @@ import queue
 import socket
 import struct
 import threading
+import time
 import wave
 
 from kivy.config import Config
@@ -52,9 +65,11 @@ from kivy.utils import platform
 # --------------------------------------------------------------------------- #
 
 DEFAULT_ROUND_SECONDS = 60
-ROUNDS_PER_MATCH = 2          # round 3 is added automatically only on a tie
+ROUNDS_PER_MATCH = 2          # round 3 (sudden-death decider) is added only on a 1-1 tie
 PENALTY_FLOOR_ZERO = True     # score never goes below 0
 TCP_PORT = 5005
+DEBOUNCE_SECONDS = 0.25       # ignore a repeat score for the same player inside this window
+                               # (one physical touch = one point, no double-counting)
 
 BG        = (0.043, 0.055, 0.078, 1)
 PANEL_BG  = (0.078, 0.094, 0.129, 1)
@@ -103,7 +118,8 @@ def _write_wav(path, segments, sample_rate=22050):
 SOUND_RECIPES = {
     'touch':   [(1180, 90, 0.55)],
     'penalty': [(320, 150, 0.55), (0, 40, 0), (240, 180, 0.55)],
-    'timeup':  [(880, 220, 0.6), (0, 70, 0), (660, 220, 0.6), (0, 70, 0), (440, 420, 0.6)],
+    # long referee-whistle style tone for "round over"
+    'timeup':  [(2200, 1600, 0.65)],
 }
 
 
@@ -229,14 +245,6 @@ class HitServer(threading.Thread):
         finally:
             self.clients = max(0, self.clients - 1)
             try:
-                conn.close()
-            except Exception:              # noqa: BLE001
-                pass
-
-    @staticmethod
-    def _decode(raw):
-        try:
-            cmd = raw.decode('utf-8', 'ignore').strip().upper()
         except Exception:                  # noqa: BLE001
             return None
         return cmd if cmd in VALID_COMMANDS else None
@@ -305,15 +313,16 @@ def make_label(text, size, color=WHITE, bold=False, halign='center'):
 
 
 def popup(message, sub='', button_text=None, on_close=None,
-          auto_seconds=None, accent=GOLD):
+          auto_seconds=None, accent=GOLD,
+          sub_size=17, sub_color=DIM, sub_bold=False):
     """Centered modal. Either a button, or an auto-dismiss timer, or both."""
-    view = ModalView(size_hint=(0.62, 0.55), auto_dismiss=False,
+    view = ModalView(size_hint=(0.66, 0.58), auto_dismiss=False,
                      background_color=(0, 0, 0, 0.75))
     card = Card(bg=PANEL_BG, orientation='vertical',
                 padding=dp(18), spacing=dp(10))
     card.add_widget(make_label(message, 30, accent, bold=True))
     if sub:
-        card.add_widget(make_label(sub, 17, DIM))
+        card.add_widget(make_label(sub, sub_size, sub_color, bold=sub_bold))
 
     fired = {'done': False}
 
@@ -362,10 +371,12 @@ class PlayerPanel(Card):
         self.add_widget(self.pen_lbl)
 
         btns = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
-        btns.add_widget(make_button('TOUCH +1', accent,
-                                    lambda: self.app.add_hit(self.key, manual=True)))
-        btns.add_widget(make_button('PENALTY -1', GREY,
-                                    lambda: self.app.add_penalty(self.key, manual=True)))
+        self.touch_btn = make_button('TOUCH +1', accent,
+                                     lambda: self.app.add_hit(self.key, manual=True))
+        self.penalty_btn = make_button('PENALTY -1', GREY,
+                                       lambda: self.app.add_penalty(self.key, manual=True))
+        btns.add_widget(self.touch_btn)
+        btns.add_widget(self.penalty_btn)
         self.add_widget(btns)
 
     @property
@@ -375,6 +386,12 @@ class PlayerPanel(Card):
     def update(self, score, penalties):
         self.score_lbl.text = str(score)
         self.pen_lbl.text = 'PENALTY  %d' % penalties
+
+    def set_locked(self, locked):
+        """Grey out and disable the score buttons when the timer isn't running."""
+        for btn in (self.touch_btn, self.penalty_btn):
+            btn.disabled = locked
+            btn.opacity = 0.35 if locked else 1
 
     def on_touch_down(self, touch):
         # let the two buttons take the touch first
@@ -418,20 +435,13 @@ class SilambamApp(App):
         self.round_seconds = DEFAULT_ROUND_SECONDS
         self.state = IDLE
         self.round_no = 1
-        self.max_rounds = ROUNDS_PER_MATCH
         self.remaining = float(self.round_seconds)
         self.score = {'A': 0, 'B': 0}
         self.penalties = {'A': 0, 'B': 0}
         self.round_wins = {'A': 0, 'B': 0}
+        self._last_score_time = {'A': 0.0, 'B': 0.0}
         self._pause_view = None
 
-        self.audio = Audio(self.user_data_dir)
-
-        self.cmd_queue = queue.Queue()
-        self.server = HitServer(self.cmd_queue, TCP_PORT)
-        self.server.start()
-
-        root = RootLayout()
         body = BoxLayout(orientation='horizontal', spacing=dp(10),
                          padding=dp(10), size_hint=(1, 1))
 
@@ -453,21 +463,20 @@ class SilambamApp(App):
         col = Card(bg=PANEL_BG, orientation='vertical', padding=dp(10),
                    spacing=dp(6), size_hint_x=0.32)
 
-        top = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(6))
-        self.round_lbl = make_label('ROUND 1 / 2', 18, GOLD, bold=True)
+        top = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(6))
+        self.round_lbl = make_label('ROUND 1', 18, GOLD, bold=True)
+        self.round_lbl.shorten = True
         top.add_widget(self.round_lbl)
-        gear = make_button('SETTINGS', CARD_BG, self.open_settings, font_size=13)
+        gear = make_button('SETTINGS', CARD_BG, self.open_settings, font_size=12)
         gear.size_hint_x = None
-        gear.width = dp(96)
+        gear.width = dp(88)
         top.add_widget(gear)
+        self.settings_btn = gear
         col.add_widget(top)
 
         self.time_lbl = make_label('01:00', 84, WHITE, bold=True)
         col.add_widget(self.time_lbl)
 
-        self.state_lbl = make_label('PRESS START', 16, DIM)
-        self.state_lbl.size_hint_y = None
-        self.state_lbl.height = dp(24)
         col.add_widget(self.state_lbl)
 
         self.start_btn = make_button('START', GREEN, self.on_start_button, font_size=22)
@@ -476,8 +485,10 @@ class SilambamApp(App):
         col.add_widget(self.start_btn)
 
         row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        row.add_widget(make_button('End Round', GREY, self.end_round_manual, font_size=15))
-        row.add_widget(make_button('NEW MATCH', CARD_BG, self.confirm_new_match, font_size=15))
+        self.end_round_btn = make_button('End Round', GREY, self.end_round_manual, font_size=15)
+        self.new_match_btn = make_button('NEW MATCH', CARD_BG, self.confirm_new_match, font_size=15)
+        row.add_widget(self.end_round_btn)
+        row.add_widget(self.new_match_btn)
         col.add_widget(row)
 
         self.net_lbl = make_label('ESP32 server starting...', 12, DIM)
@@ -486,21 +497,56 @@ class SilambamApp(App):
         col.add_widget(self.net_lbl)
         return col
 
+    # ---------------- decider (round 3 sudden death) ----------------
+
+    @property
+    def is_decider(self):
+        return self.round_no > ROUNDS_PER_MATCH
+
+    def _check_decider_result(self):
+        if self.is_decider and self.state == RUNNING and self.score['A'] != self.score['B']:
+            winner = 'A' if self.score['A'] > self.score['B'] else 'B'
+            self._decider_win(winner)
+
+    def _decider_win(self, key):
+        self.round_wins[key] += 1
+        self.state = FINISHED
+        self._refresh()
+    def _decider_timeout(self):
+        self.state = BREAK
+        self.audio.play('timeup')
+        self._refresh()
+        self._coin_toss()
+
+    def _coin_toss(self):
+        view = ModalView(size_hint=(0.64, 0.56), auto_dismiss=False,
+                         background_color=(0, 0, 0, 0.75))
+        card = Card(bg=PANEL_BG, orientation='vertical', padding=dp(18), spacing=dp(14))
+        card.add_widget(make_label('TIME UP - SCORES LEVEL', 22, GOLD, bold=True))
+        card.add_widget(make_label('Coin toss - tap the winner', 16, DIM))
+
+        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(12))
+
+        def choose(key):
+            view.dismiss()
+            self._decider_win(key)
+
+        row.add_widget(make_button('PLAYER A', RED, lambda: choose('A'), font_size=20))
+        row.add_widget(make_button('PLAYER B', BLUE, lambda: choose('B'), font_size=20))
+        card.add_widget(row)
+        view.add_widget(card)
+        view.open()
+
     # ---------------- scoring ----------------
 
     def add_hit(self, key, manual=False):
         if self.state != RUNNING:
             self._blip('Timer is not running')
             return
-        self.score[key] += 1
-        self.audio.play('touch')
-        self._flash(key)
-        self._refresh()
-
-    def add_penalty(self, key, manual=False):
-        if self.state != RUNNING:
-            self._blip('Timer is not running')
-            return
+        now = time.time()
+        if now - self._last_score_time.get(key, 0.0) < DEBOUNCE_SECONDS:
+            return                                  # one tap = one point, ignore the bounce
+        self._last_score_time[key] = now
         self.penalties[key] += 1
         self.score[key] -= 1
         if PENALTY_FLOOR_ZERO and self.score[key] < 0:
@@ -508,6 +554,7 @@ class SilambamApp(App):
         self.audio.play('penalty')
         self._flash(key, penalty=True)
         self._refresh()
+        self._check_decider_result()
 
     def _flash(self, key, penalty=False):
         panel = self.panel_a if key == 'A' else self.panel_b
@@ -535,16 +582,6 @@ class SilambamApp(App):
             self.resume()
 
     # ---------------- match flow ----------------
-
-    def on_start_button(self):
-        if self.state == IDLE:
-            self.start_round()
-        elif self.state == RUNNING:
-            self.pause()
-        elif self.state == PAUSED:
-            self.resume()
-        elif self.state == FINISHED:
-            self.confirm_new_match()
 
     def start_round(self):
         self.remaining = float(self.round_seconds)
@@ -577,6 +614,8 @@ class SilambamApp(App):
         self._refresh()
 
     def end_round_manual(self):
+        if self.is_decider:
+            return                      # locked - decider ends by sudden death or coin toss
         if self.state in (RUNNING, PAUSED):
             if self._pause_view:
                 self._pause_view.dismiss()
@@ -584,61 +623,67 @@ class SilambamApp(App):
             self._end_round()
 
     def _end_round(self):
+        if self.is_decider:
+            self._decider_timeout()
+            return
+
         self.state = BREAK
         self.remaining = 0.0
         self.audio.play('timeup')
         self._refresh()
 
         a, b = self.score['A'], self.score['B']
-        if a > b:
-            self.round_wins['A'] += 1
-        elif b > a:
-            self.round_wins['B'] += 1
+        round_winner = 'A' if a > b else ('B' if b > a else None)
+        if round_winner:
+            self.round_wins[round_winner] += 1
+        summary = 'A  %d   -   %d  B' % (a, b)
 
-        if self.round_no < self.max_rounds:
+        if self.round_no < ROUNDS_PER_MATCH:
+            popup('ROUND %d OVER' % self.round_no, summary,
+                  button_text='NEXT ROUND', on_close=self._prepare_round,
+                  accent=GOLD, sub_size=36, sub_color=WHITE, sub_bold=True)
+            return
+
+        if self.round_wins['A'] == self.round_wins['B']:
             popup('ROUND %d OVER' % self.round_no,
-                  'A  %d   -   %d  B\nNext round starts in a moment' % (a, b),
-                  auto_seconds=3.0, on_close=self._next_round)
-        elif a == b:
-            # tie -> decider
-            self.max_rounds = self.round_no + 1
-            popup('SCORES LEVEL  %d - %d' % (a, b),
-                  'ROUND %d DECIDER' % self.max_rounds,
-                  auto_seconds=3.0, on_close=self._next_round, accent=GOLD)
+                  summary + '\nROUNDS LEVEL - DECIDER ROUND NEXT',
+                  button_text='NEXT ROUND', on_close=self._prepare_round,
+                  accent=GOLD, sub_size=30, sub_color=WHITE, sub_bold=True)
         else:
             self._finish()
 
-    def _next_round(self):
+    def _prepare_round(self):
+        """Advance to the next round but wait for a manual START press."""
         self.round_no += 1
-        self.start_round()
+        self.score = {'A': 0, 'B': 0}
+        self.penalties = {'A': 0, 'B': 0}
+        self.state = IDLE
+        self._refresh()
 
     def _finish(self):
         self.state = FINISHED
-        a, b = self.score['A'], self.score['B']
-        if a > b:
+        aw, bw = self.round_wins['A'], self.round_wins['B']
+        if aw > bw:
             winner, accent = 'PLAYER A WINS', RED
-        elif b > a:
+        elif bw > aw:
             winner, accent = 'PLAYER B WINS', BLUE
         else:
             winner, accent = 'MATCH DRAWN', GOLD
         self._refresh()
-        popup(winner, 'Final   A  %d   -   %d  B' % (a, b),
-              button_text='CLOSE', accent=accent)
+        popup(winner, 'Rounds won   A  %d   -   %d  B' % (aw, bw),
+              button_text='CLOSE', accent=accent,
+              sub_size=28, sub_color=WHITE, sub_bold=True)
 
     def confirm_new_match(self):
+        if self.is_decider and self.state in (RUNNING, PAUSED):
+            return                      # locked during the decider round
         if self.state in (RUNNING, PAUSED):
-            self.state = PAUSED
-            self._refresh()
-        popup('START A NEW MATCH?', 'Scores and rounds will be cleared',
-              button_text='YES, RESET', on_close=self.new_match)
-
     def new_match(self):
         if self._pause_view:
             self._pause_view.dismiss()
             self._pause_view = None
         self.state = IDLE
         self.round_no = 1
-        self.max_rounds = ROUNDS_PER_MATCH
         self.remaining = float(self.round_seconds)
         self.score = {'A': 0, 'B': 0}
         self.penalties = {'A': 0, 'B': 0}
@@ -653,7 +698,10 @@ class SilambamApp(App):
         self.remaining -= dt
         if self.remaining <= 0:
             self.remaining = 0.0
-            self._end_round()
+            if self.is_decider:
+                self._decider_timeout()
+            else:
+                self._end_round()
             return
         self.time_lbl.text = self._clock_text()
 
@@ -689,6 +737,9 @@ class SilambamApp(App):
     # ---------------- settings ----------------
 
     def open_settings(self):
+        if self.is_decider and self.state in (RUNNING, PAUSED):
+            return                      # locked during the decider round
+
         was_running = self.state == RUNNING
         if was_running:
             self.state = PAUSED
@@ -755,18 +806,28 @@ class SilambamApp(App):
     def _refresh(self, *_a):
         self.panel_a.update(self.score['A'], self.penalties['A'])
         self.panel_b.update(self.score['B'], self.penalties['B'])
-        self.round_lbl.text = 'ROUND %d / %d' % (self.round_no, self.max_rounds)
+        score_locked = self.state != RUNNING
+        self.panel_a.set_locked(score_locked)
+        self.panel_b.set_locked(score_locked)
+        self.round_lbl.text = 'ROUND %d' % self.round_no
         self.time_lbl.text = self._clock_text()
+
+        # decider round: only START / PAUSE / RESUME are allowed
+        lock_extra = self.is_decider and self.state in (RUNNING, PAUSED)
+        for btn in (self.end_round_btn, self.new_match_btn, self.settings_btn):
+            btn.disabled = lock_extra
+            btn.opacity = 0.35 if lock_extra else 1
 
         if self.state == IDLE:
             self.start_btn.text = 'START'
             self.start_btn.background_color = GREEN
-            self.state_lbl.text = 'PRESS START'
+            self.state_lbl.text = 'SUDDEN DEATH - PRESS START' if self.is_decider else 'PRESS START'
             self.time_lbl.color = WHITE
         elif self.state == RUNNING:
             self.start_btn.text = 'PAUSE'
             self.start_btn.background_color = GOLD
-            self.state_lbl.text = 'LIVE  -  tap a player box to score'
+            self.state_lbl.text = ('SUDDEN DEATH - FIRST POINT WINS' if self.is_decider
+                                    else 'LIVE  -  tap a player box to score')
             self.time_lbl.color = GREEN if self.remaining > 10 else RED
         elif self.state == PAUSED:
             self.start_btn.text = 'RESUME'
